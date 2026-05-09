@@ -163,7 +163,16 @@ class Gaussian(nn.Module):
         r: torch.Tensor,
         cell: Optional[torch.Tensor],
         batch: Optional[torch.Tensor] = None,
+        u: Optional[torch.Tensor] = None,
+        quad: Optional[torch.Tensor] = None,
+        kappa: Optional[torch.Tensor] = None,
+        alpha: Optional[torch.Tensor] = None,
+        e_ext: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if (u is not None) or (quad is not None) or (kappa is not None) or (alpha is not None):
+            return self.compute_multipole_bundle(
+                q=q, r=r, cell=cell, batch=batch, u=u, quad=quad, kappa=kappa, alpha=alpha, e_ext=e_ext
+            )["energy"]
         return self.compute_bundle(
             q=q,
             r=r,
@@ -172,6 +181,341 @@ class Gaussian(nn.Module):
             compute_force=False,
             compute_virial=False,
         )["energy"]
+
+    @staticmethod
+    def _ensure_multipole_shapes(
+        q: torch.Tensor,
+        u: Optional[torch.Tensor],
+        quad: Optional[torch.Tensor],
+        kappa: Optional[torch.Tensor],
+        alpha: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if q.dim() == 1:
+            q = q.unsqueeze(1)
+        n, nq = q.shape
+        if u is not None:
+            if u.dim() == 2 and u.shape[1] == 3:
+                u = u.unsqueeze(1)
+            if u.shape != (n, nq, 3):
+                raise ValueError(f"u shape mismatch: expected {(n, nq, 3)}, got {tuple(u.shape)}")
+        if quad is not None:
+            if quad.dim() == 3 and quad.shape[1:] == (3, 3):
+                quad = quad.unsqueeze(1)
+            if quad.shape != (n, nq, 3, 3):
+                raise ValueError(
+                    f"quad shape mismatch: expected {(n, nq, 3, 3)}, got {tuple(quad.shape)}"
+                )
+        if kappa is not None:
+            if kappa.dim() == 1:
+                kappa = kappa.unsqueeze(1)
+            if kappa.shape != (n, nq):
+                raise ValueError(
+                    f"kappa shape mismatch: expected {(n, nq)}, got {tuple(kappa.shape)}"
+                )
+        if alpha is not None:
+            if alpha.dim() == 1:
+                alpha = alpha.unsqueeze(1)
+            elif alpha.dim() == 3 and alpha.shape[1:] == (3, 3):
+                alpha = alpha.unsqueeze(1)
+            if alpha.dim() == 2:
+                if alpha.shape != (n, nq):
+                    raise ValueError(
+                        f"alpha shape mismatch: expected {(n, nq)} for scalar alpha, got {tuple(alpha.shape)}"
+                    )
+            elif alpha.dim() == 4 and alpha.shape[2:] == (3, 3):
+                if alpha.shape != (n, nq, 3, 3):
+                    raise ValueError(
+                        f"alpha shape mismatch: expected {(n, nq, 3, 3)} for tensor alpha, got {tuple(alpha.shape)}"
+                    )
+            else:
+                raise ValueError("alpha should be [n] / [n,nq] or [n,3,3] / [n,nq,3,3]")
+        return q, u, quad, kappa, alpha
+
+    def _build_realspace_derivative_tensors(
+        self,
+        r_raw: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = r_raw.unsqueeze(0) - r_raw.unsqueeze(1)  # [n,n,3]
+        r2 = torch.sum(x * x, dim=-1)
+        n = r_raw.shape[0]
+        eye = torch.eye(3, dtype=r_raw.dtype, device=r_raw.device)
+
+        amp = self.amp.to(dtype=r_raw.dtype, device=r_raw.device).view(1, 1, -1)
+        bw2 = self.bandwidth.to(dtype=r_raw.dtype, device=r_raw.device).view(1, 1, -1)
+        exp_term = torch.exp(-0.5 * r2.unsqueeze(-1) / bw2)
+
+        phi = torch.sum(amp * exp_term, dim=-1)
+
+        c1 = torch.sum(-(amp / bw2) * exp_term, dim=-1)
+        T1 = c1[..., None] * x
+
+        xx = x[..., :, None] * x[..., None, :]
+        c2 = torch.sum((amp / (bw2 * bw2)) * exp_term, dim=-1)
+        c3 = torch.sum((amp / bw2) * exp_term, dim=-1)
+        T2 = c2[..., None, None] * xx - c3[..., None, None] * eye[None, None]
+
+        xxx = torch.einsum("...a,...b,...c->...abc", x, x, x)
+        term_delta_x = (
+            torch.einsum("ab,...c->...abc", eye, x)
+            + torch.einsum("ac,...b->...abc", eye, x)
+            + torch.einsum("bc,...a->...abc", eye, x)
+        )
+        c4 = torch.sum(-(amp / (bw2 * bw2 * bw2)) * exp_term, dim=-1)
+        c5 = torch.sum((amp / (bw2 * bw2)) * exp_term, dim=-1)
+        T3 = c4[..., None, None, None] * xxx + c5[..., None, None, None] * term_delta_x
+
+        xxxx = torch.einsum("...a,...b,...c,...d->...abcd", x, x, x, x)
+        term_delta_rr = (
+            torch.einsum("ab,...cd->...abcd", eye, xx)
+            + torch.einsum("ac,...bd->...abcd", eye, xx)
+            + torch.einsum("ad,...bc->...abcd", eye, xx)
+            + torch.einsum("bc,...ad->...abcd", eye, xx)
+            + torch.einsum("bd,...ac->...abcd", eye, xx)
+            + torch.einsum("cd,...ab->...abcd", eye, xx)
+        )
+        term_delta_delta = (
+            torch.einsum("ab,cd->abcd", eye, eye)
+            + torch.einsum("ac,bd->abcd", eye, eye)
+            + torch.einsum("ad,bc->abcd", eye, eye)
+        ).unsqueeze(0).unsqueeze(0)
+        c6 = torch.sum((amp / (bw2 * bw2 * bw2 * bw2)) * exp_term, dim=-1)
+        c7 = torch.sum((amp / (bw2 * bw2 * bw2)) * exp_term, dim=-1)
+        c8 = torch.sum((amp / (bw2 * bw2)) * exp_term, dim=-1)
+        T4 = (
+            c6[..., None, None, None, None] * xxxx
+            - c7[..., None, None, None, None] * term_delta_rr
+            + c8[..., None, None, None, None] * term_delta_delta
+        )
+
+        if self.remove_self_interaction:
+            diag = torch.arange(n, device=r_raw.device)
+            phi[diag, diag] = 0.0
+            T1[diag, diag] = 0.0
+            T2[diag, diag] = 0.0
+            T3[diag, diag] = 0.0
+            T4[diag, diag] = 0.0
+        return phi, T1, T2, T3, T4
+
+    def _compute_multipole_realspace_one(
+        self,
+        r_raw: torch.Tensor,
+        q: torch.Tensor,
+        u: Optional[torch.Tensor],
+        quad: Optional[torch.Tensor],
+        kappa: Optional[torch.Tensor],
+        alpha: Optional[torch.Tensor],
+        e_ext: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        q, u, quad, kappa, alpha = self._ensure_multipole_shapes(q, u, quad, kappa, alpha)
+        phi_ij, T1, T2, T3, T4 = self._build_realspace_derivative_tensors(r_raw)
+        _n, _nq = q.shape
+
+        e_phi = torch.einsum("iq,ij->jq", q, phi_ij)
+        pot = 0.5 * torch.einsum("iq,iq->q", e_phi, q)
+        e_field = torch.einsum("iq,ijc->jqc", q, T1)
+
+        if u is not None:
+            e_phi_u = -torch.einsum("iqc,ijc->jq", u, T1)
+            e_phi = e_phi + e_phi_u
+            pot = pot + torch.einsum("iq,iq->q", e_phi_u, q)
+            E_u = torch.einsum("ijcd,iqc->jqd", T2, u)
+            pot = pot - 0.5 * torch.einsum("iqc,iqc->q", u, E_u)
+            e_field = e_field + E_u
+
+        if quad is not None:
+            e_phi_Q = 0.5 * torch.einsum("iqab,ijab->jq", quad, T2)
+            e_phi = e_phi + e_phi_Q
+            pot = pot + torch.einsum("iq,iq->q", q, e_phi_Q)
+            pot = pot + 0.125 * torch.einsum("iqab,ijabcd,jqcd->q", quad, T4, quad)
+            E_Q = 0.5 * torch.einsum("iqab,ijabc->jqc", quad, T3)
+            e_field = e_field + E_Q
+            if u is not None:
+                pot = pot - torch.einsum("iqc,iqc->q", u, E_Q)
+
+        q_induced = torch.zeros_like(q)
+        if kappa is not None:
+            q_induced = -kappa * e_phi
+            pot = pot + 0.5 * torch.einsum("iq,iq->q", e_phi, q_induced)
+
+        u_induced = torch.zeros_like(e_field)
+        if alpha is not None:
+            e_field_eff = e_field
+            if e_ext is not None:
+                e_field_eff = e_field_eff + e_ext[None, None, :]
+            if alpha.dim() == 2:
+                u_induced = e_field_eff * alpha.unsqueeze(2)
+            else:
+                u_induced = torch.einsum("iqc,iqcd->iqd", e_field_eff, alpha)
+            pot = pot - 0.5 * torch.einsum("iqc,iqc->q", e_field_eff, u_induced)
+
+        return pot.sum().view(-1), q_induced, e_phi, u_induced
+
+    def _compute_multipole_periodic_one(
+        self,
+        r_raw: torch.Tensor,
+        q: torch.Tensor,
+        cell_now: torch.Tensor,
+        u: Optional[torch.Tensor],
+        quad: Optional[torch.Tensor],
+        kappa: Optional[torch.Tensor],
+        alpha: Optional[torch.Tensor],
+        e_ext: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        q, u, quad, kappa, alpha = self._ensure_multipole_shapes(q, u, quad, kappa, alpha)
+        n, nq = q.shape
+        state = self._prepare_triclinic_state(r_raw, q, cell_now)
+        volume = state["volume"]
+        kfac = state["kfac"].reshape(-1)
+
+        kvec = state["g_cart"].reshape(3, -1).transpose(0, 1)
+        k_mask = state["k_mode_mask"].reshape(-1)
+        if not torch.any(k_mask):
+            z = torch.zeros((nq,), dtype=r_raw.dtype, device=r_raw.device)
+            return z.sum().view(-1), torch.zeros_like(q), torch.zeros_like(q)
+        kvec = kvec[k_mask]
+        kfac = kfac[k_mask]
+
+        k_dot_r = torch.matmul(r_raw, kvec.transpose(0, 1))
+        cos_kr = torch.cos(k_dot_r)
+        sin_kr = torch.sin(k_dot_r)
+
+        Sq_real = (q.unsqueeze(2) * cos_kr.unsqueeze(1)).sum(dim=0)
+        Sq_imag = (q.unsqueeze(2) * sin_kr.unsqueeze(1)).sum(dim=0)
+
+        uk = torch.zeros((n, nq, kvec.shape[0]), dtype=r_raw.dtype, device=r_raw.device)
+        if u is not None:
+            uk = torch.einsum("nqc,mc->nqm", u, kvec)
+        Su_real = -(uk * sin_kr.unsqueeze(1)).sum(dim=0)
+        Su_imag = (uk * cos_kr.unsqueeze(1)).sum(dim=0)
+
+        qk2 = torch.zeros((n, nq, kvec.shape[0]), dtype=r_raw.dtype, device=r_raw.device)
+        if quad is not None:
+            qk2 = torch.einsum("mi,nqij,mj->nqm", kvec, quad, kvec)
+        SQ_real = -0.5 * (qk2 * cos_kr.unsqueeze(1)).sum(dim=0)
+        SQ_imag = -0.5 * (qk2 * sin_kr.unsqueeze(1)).sum(dim=0)
+
+        S_real = Sq_real + Su_real + SQ_real
+        S_imag = Sq_imag + Su_imag + SQ_imag
+        S_sq = S_real.square() + S_imag.square()
+
+        pot = (kfac.unsqueeze(0) * S_sq).sum(dim=1) / (2.0 * volume)
+
+        if self.remove_self_interaction:
+            self_sq = (q.unsqueeze(2) - 0.5 * qk2).square() + uk.square()
+            self_sum = self_sq.sum(dim=0)
+            pot = pot - (kfac.unsqueeze(0) * self_sum).sum(dim=1) / (2.0 * volume)
+
+        prefactor = (2.0 * kfac) / volume
+        term_real = S_real.unsqueeze(0) * cos_kr.unsqueeze(1) + S_imag.unsqueeze(0) * sin_kr.unsqueeze(1)
+        e_phi = (prefactor.unsqueeze(0) * term_real).sum(dim=2)
+        if self.remove_self_interaction:
+            s_real_i = q.unsqueeze(2) - 0.5 * qk2
+            e_phi = e_phi - (prefactor.unsqueeze(0) * s_real_i).sum(dim=2)
+
+        q_induced = torch.zeros_like(q)
+        if kappa is not None:
+            q_induced = -kappa * e_phi
+            pot = pot + 0.5 * torch.einsum("iq,iq->q", e_phi, q_induced)
+        term_imag = S_real.unsqueeze(0) * sin_kr.unsqueeze(1) - S_imag.unsqueeze(0) * cos_kr.unsqueeze(1)
+        e_field = (
+            prefactor.unsqueeze(0).unsqueeze(0).unsqueeze(3)
+            * term_imag.unsqueeze(3)
+            * kvec.unsqueeze(0).unsqueeze(0)
+        ).sum(dim=2)
+
+        if self.remove_self_interaction and u is not None:
+            e_field = e_field - (
+                prefactor.unsqueeze(0).unsqueeze(0).unsqueeze(3)
+                * uk.unsqueeze(3)
+                * kvec.unsqueeze(0).unsqueeze(0)
+            ).sum(dim=2)
+
+        u_induced = torch.zeros_like(e_field)
+        if alpha is not None:
+            e_field_eff = e_field
+            if e_ext is not None:
+                e_field_eff = e_field_eff + e_ext[None, None, :]
+            if alpha.dim() == 2:
+                u_induced = e_field_eff * alpha.unsqueeze(2)
+            else:
+                u_induced = torch.einsum("iqc,iqcd->iqd", e_field_eff, alpha)
+            pot = pot - 0.5 * torch.einsum("iqc,iqc->q", e_field_eff, u_induced)
+
+        return pot.sum().view(-1), q_induced, e_phi, u_induced
+
+    def compute_multipole_bundle(
+        self,
+        q: torch.Tensor,
+        r: torch.Tensor,
+        cell: Optional[torch.Tensor],
+        batch: Optional[torch.Tensor] = None,
+        u: Optional[torch.Tensor] = None,
+        quad: Optional[torch.Tensor] = None,
+        kappa: Optional[torch.Tensor] = None,
+        alpha: Optional[torch.Tensor] = None,
+        e_ext: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        if q.dim() == 1:
+            q = q.unsqueeze(1)
+        n, d = r.shape
+        assert d == 3, "r dimension error"
+        assert n == q.size(0), "q dimension error"
+        if batch is None:
+            batch = torch.zeros(n, dtype=torch.int64, device=r.device)
+        if cell is not None and (cell.dim() != 3 or cell.shape[-2:] != (3, 3)):
+            raise ValueError(f"`cell` should be [nbatch, 3, 3], got {tuple(cell.shape)}")
+
+        energies = []
+        q_induced_full = torch.zeros_like(q)
+        phi_full = torch.zeros_like(q)
+        u_induced_full = torch.zeros((n, q.shape[1], 3), dtype=r.dtype, device=r.device)
+
+        for bid_t in torch.unique(batch):
+            bid = int(bid_t.item())
+            mask = batch == bid_t
+            r_now = r[mask]
+            q_now = q[mask]
+            u_now = u[mask] if u is not None else None
+            quad_now = quad[mask] if quad is not None else None
+            kappa_now = kappa[mask] if kappa is not None else None
+            alpha_now = alpha[mask] if alpha is not None else None
+
+            periodic = False
+            box_now = None
+            if cell is not None:
+                box_now = cell[bid]
+                periodic = torch.abs(torch.det(box_now)) > torch.finfo(box_now.dtype).eps
+
+            if periodic:
+                assert box_now is not None
+                e_now, dq_now, phi_now, du_now = self._compute_multipole_periodic_one(
+                    r_now, q_now, box_now, u_now, quad_now, kappa_now, alpha_now, e_ext
+                )
+            else:
+                e_now, dq_now, phi_now, du_now = self._compute_multipole_realspace_one(
+                    r_now, q_now, u_now, quad_now, kappa_now, alpha_now, e_ext
+                )
+
+            energies.append(e_now)
+            q_induced_full[mask] = dq_now
+            phi_full[mask] = phi_now
+            u_induced_full[mask] = du_now
+
+        # Match LES Ewald: one scalar per batch index as shape [n_batch], not [n_batch, 1]
+        # (torch.stack on shape-[1] tensors would yield [n_batch, 1] and break FeatureAdd vs SR_energy).
+        if energies:
+            energy_out = torch.cat(energies, dim=0) * self.norm_factor
+        else:
+            energy_out = torch.zeros(0, dtype=r.dtype, device=r.device)
+        return {
+            "energy": energy_out,
+            "q_induced": q_induced_full,
+            "u_induced": u_induced_full,
+            "phi": phi_full,
+            "forces": None,
+            "virial": None,
+            "used_explicit_derivatives": False,
+        }
 
     def compute_bundle(
         self,

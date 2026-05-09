@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Union
 import torch
 import torch.nn as nn
 
-from .module import Atomwise, BEC, Gaussian
+from .module import Atomwise, BEC, Gaussian, FixedCharges, AtomicAlpha
 
 
 RCUT_TO_SIGMA = 1.9892536839080267
@@ -18,8 +18,15 @@ class Sog(nn.Module):
         self,
         sog_arguments: Union[Dict[str, Any], str, None] = None,
         r_cut: Optional[float] = None,
+        les_arguments: Union[Dict[str, Any], str, None] = None,
     ):
         super().__init__()
+
+        if sog_arguments is not None and les_arguments is not None:
+            raise ValueError("Pass only one of `sog_arguments` and `les_arguments`.")
+
+        if les_arguments is not None:
+            sog_arguments = les_arguments
 
         if sog_arguments is None:
             sog_arguments = {}
@@ -48,6 +55,12 @@ class Sog(nn.Module):
             if self.use_atomwise
             else _DummyAtomwise()
         )
+        if self.use_fixed_atomic_charges:
+            self.fixed_charges = FixedCharges(
+                normalization_factor=self.fixed_atomic_charges_scaling_factor
+            )
+        if self.use_atomic_alpha:
+            self.atomic_alpha = AtomicAlpha()
 
         self.gaussian = Gaussian(
             n_dl=self.n_dl,
@@ -101,6 +114,13 @@ class Sog(nn.Module):
 
         self.remove_mean = bool(args.get("remove_mean", True))
         self.epsilon_factor = float(args.get("epsilon_factor", 1.0))
+        # LES-style alias compatibility
+        self.use_fixed_atomic_charges = bool(args.get("use_fixed_atomic_charges", False))
+        self.fixed_atomic_charges_scaling_factor = float(
+            args.get("fixed_atomic_charges_scaling_factor", 0.5)
+        )
+        self.use_atomic_alpha = bool(args.get("use_atomic_alpha", False))
+        self.use_epsilon_r_scaling = bool(args.get("use_epsilon_r_scaling", False))
 
     def forward(
         self,
@@ -108,6 +128,12 @@ class Sog(nn.Module):
         cell: Optional[torch.Tensor],
         desc: Optional[torch.Tensor] = None,
         latent_charges: Optional[torch.Tensor] = None,
+        latent_dipoles: Optional[torch.Tensor] = None,
+        latent_quads: Optional[torch.Tensor] = None,
+        latent_kappas: Optional[torch.Tensor] = None,
+        latent_alphas: Optional[torch.Tensor] = None,
+        atomic_numbers: Optional[torch.Tensor] = None,
+        e_ext: Optional[torch.Tensor] = None,
         batch: Optional[torch.Tensor] = None,
         compute_energy: bool = True,
         compute_bec: bool = False,
@@ -128,13 +154,64 @@ class Sog(nn.Module):
         else:
             raise ValueError("Either desc or latent_charges must be provided")
 
+        if (
+            atomic_numbers is not None
+            and hasattr(self, "use_fixed_atomic_charges")
+            and self.use_fixed_atomic_charges
+        ):
+            latent_charges = latent_charges + self.fixed_charges(atomic_numbers)
+
+        if (
+            atomic_numbers is not None
+            and hasattr(self, "use_atomic_alpha")
+            and self.use_atomic_alpha
+            and latent_alphas is not None
+        ):
+            baseline_alphas = self.atomic_alpha(atomic_numbers)
+            if latent_alphas.dim() == 1:
+                latent_alphas = latent_alphas + baseline_alphas
+            elif latent_alphas.dim() == 3:
+                latent_alphas = latent_alphas + baseline_alphas[:, None, None] * torch.eye(
+                    3, device=baseline_alphas.device
+                ).unsqueeze(0)
+
         if compute_energy:
-            e_lr = self.gaussian(
-                q=latent_charges,
-                r=positions,
-                cell=cell,
-                batch=batch,
-            )
+            if (
+                (latent_dipoles is not None)
+                or (latent_quads is not None)
+                or (latent_kappas is not None)
+                or (latent_alphas is not None)
+            ):
+                out_m = self.gaussian.compute_multipole_bundle(
+                    q=latent_charges,
+                    r=positions,
+                    cell=cell,
+                    batch=batch,
+                    u=latent_dipoles,
+                    quad=latent_quads,
+                    kappa=latent_kappas,
+                    alpha=latent_alphas,
+                    e_ext=e_ext,
+                )
+                e_lr = out_m["energy"]
+                q_induced = out_m["q_induced"]
+                u_induced = out_m["u_induced"]
+                if q_induced is not None:
+                    latent_charges = latent_charges + q_induced
+                if u_induced is not None:
+                    if latent_dipoles is not None:
+                        if latent_dipoles.dim() == 2 and u_induced.dim() == 3:
+                            latent_dipoles = latent_dipoles.unsqueeze(1)
+                        latent_dipoles = latent_dipoles + u_induced
+                    else:
+                        latent_dipoles = u_induced
+            else:
+                e_lr = self.gaussian(
+                    q=latent_charges,
+                    r=positions,
+                    cell=cell,
+                    batch=batch,
+                )
         else:
             e_lr = None
 
@@ -144,6 +221,7 @@ class Sog(nn.Module):
                 q=latent_charges,
                 r=positions,
                 cell=cell,
+                u=latent_dipoles,
                 batch=batch,
                 output_index=bec_output_index,
             )
@@ -151,6 +229,9 @@ class Sog(nn.Module):
         return {
             "E_lr": e_lr,
             "latent_charges": latent_charges,
+            "latent_dipoles": latent_dipoles,
+            "latent_quads": latent_quads,
+            "latent_alphas": latent_alphas,
             "BEC": bec,
         }
 

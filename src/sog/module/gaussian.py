@@ -90,7 +90,9 @@ class Gaussian(nn.Module):
             raise ValueError(
                 "`amp` should be scalar or have the same length as `bandwidth`."
             )
-        amp_tensor *= bw2
+        # Fixed branch-aware representation:
+        # store as k-space style internal parameters (amp_k * bw2).
+        amp_tensor = amp_tensor * bw2
 
         self.amp = nn.Parameter(amp_tensor, requires_grad=trainable)
         self.bandwidth = nn.Parameter(bw2, requires_grad=trainable)
@@ -106,6 +108,13 @@ class Gaussian(nn.Module):
             Tuple[str, str, int, int, int],
             Tuple[torch.Tensor, torch.Tensor, Tuple[int, int, int]],
         ] = {}
+
+    def _amp_kspace(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        """Return Fourier-space Gaussian amplitudes from stored parameters."""
+        amp_real = self.amp.to(dtype=dtype, device=device)
+        bw2 = self.bandwidth.to(dtype=dtype, device=device)
+        bw2_safe = torch.clamp(bw2, min=torch.finfo(dtype).tiny)
+        return amp_real / bw2_safe
 
     @staticmethod
     def _device_key(device: torch.device) -> str:
@@ -240,7 +249,7 @@ class Gaussian(nn.Module):
         n = r_raw.shape[0]
         eye = torch.eye(3, dtype=r_raw.dtype, device=r_raw.device)
 
-        amp = self.amp.to(dtype=r_raw.dtype, device=r_raw.device).view(1, 1, -1)
+        amp = self._amp_kspace(dtype=r_raw.dtype, device=r_raw.device).view(1, 1, -1)
         bw2 = self.bandwidth.to(dtype=r_raw.dtype, device=r_raw.device).view(1, 1, -1)
         exp_term = torch.exp(-0.5 * r2.unsqueeze(-1) / bw2)
 
@@ -632,7 +641,7 @@ class Gaussian(nn.Module):
         r_ij = r_raw.unsqueeze(0) - r_raw.unsqueeze(1)
         r_sq = torch.sum(r_ij * r_ij, dim=-1, keepdim=True)
 
-        amp = self.amp.to(dtype=r_raw.dtype, device=r_raw.device).view(1, 1, -1)
+        amp = self._amp_kspace(dtype=r_raw.dtype, device=r_raw.device).view(1, 1, -1)
         bw2 = self.bandwidth.to(dtype=r_raw.dtype, device=r_raw.device).view(1, 1, -1)
         kernel = amp * torch.exp(-0.5 * r_sq / bw2)
         kernel = kernel.sum(dim=-1)
@@ -727,7 +736,7 @@ class Gaussian(nn.Module):
         k_sq = torch.sum(g_cart * g_cart, dim=0)
         k_mode_mask = (~zero_mask) & (k_sq <= k_sq_max)
 
-        amp = self.amp.to(dtype=real_dtype, device=runtime_device).view(
+        amp = self._amp_kspace(dtype=real_dtype, device=runtime_device).view(
             1,
             1,
             1,

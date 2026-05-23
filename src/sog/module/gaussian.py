@@ -19,6 +19,7 @@ E2_PER_ANGSTROM_TO_EV = 14.3996454784255
 SOG_DEFAULT_B = 2
 SOG_DEFAULT_SIGMA = 2.180230445405648
 SOG_DEFAULT_M = 12
+SOG_BSA_DEFAULT_B = 2.0
 
 
 class Gaussian(nn.Module):
@@ -74,8 +75,23 @@ class Gaussian(nn.Module):
         if amp is None:
             if b <= 0.0:
                 raise ValueError("`b` should be positive when `amp` is not provided.")
-            coef1 = float(4.0 * torch.pi * math.log(b))
-            amp_tensor = torch.full_like(bw2, fill_value=coef1)
+            if b <= 1.0:
+                raise ValueError("BSA initialization requires `b` > 1.")
+            if bandwidth is not None:
+                raise ValueError(
+                    "BSA init with amp=None expects geometric bandwidth from sigma/b/m."
+                )
+            # Real-space u-series (BSA) Eq.(11):
+            #   F(r) = sum_l omega_l exp(-r^2/s_l^2),
+            #   omega_l = sqrt(2/pi) * b^(-l) * log(b) / sigma,
+            #   s_l = sqrt(2) * b^l * sigma.
+            # Current code uses exp(-0.5*r^2/bw2) with bw2=(sigma*b^l)^2=s_l^2/2.
+            # Therefore set amp_eff_l = amp_l/bw2_l = omega_l.
+            ell = torch.arange(bw2.numel(), dtype=torch.get_default_dtype())
+            omega0 = math.sqrt(2.0 / math.pi) * (math.log(b) / sigma)
+            amp_tensor = omega0 * torch.pow(
+                torch.tensor(float(b), dtype=torch.get_default_dtype()), -ell
+            )
         else:
             amp_tensor = torch.as_tensor(amp, dtype=torch.get_default_dtype()).reshape(-1)
         if amp_tensor.numel() == 0:
@@ -110,11 +126,21 @@ class Gaussian(nn.Module):
         ] = {}
 
     def _amp_kspace(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        """Return Fourier-space Gaussian amplitudes from stored parameters."""
+        """Return real-space Gaussian weights omega_l (= amp_stored / bandwidth)."""
         amp_real = self.amp.to(dtype=dtype, device=device)
         bw2 = self.bandwidth.to(dtype=dtype, device=device)
         bw2_safe = torch.clamp(bw2, min=torch.finfo(dtype).tiny)
         return amp_real / bw2_safe
+
+    @staticmethod
+    def _kspace_gaussian_ft_scale(bw2: torch.Tensor) -> torch.Tensor:
+        """3D FT scale for isotropic exp(-r^2/s^2) with s^2 = 2*bw2.
+
+        ∫ exp(-r^2/s^2) exp(-i k·r) d^3r = pi^{3/2} s^3 exp(-s^2 k^2/4)
+        with s^2 = 2*bw2 gives pi^{3/2} (2*bw2)^{3/2} exp(-bw2 k^2/2).
+        """
+        coeff = (math.pi ** 1.5) * (2.0 ** 1.5)
+        return coeff * torch.pow(bw2, 1.5)
 
     @staticmethod
     def _device_key(device: torch.device) -> str:
@@ -748,7 +774,8 @@ class Gaussian(nn.Module):
             1,
             -1,
         )
-        kfac = amp * torch.exp(-0.5 * bw2 * k_sq.unsqueeze(-1))
+        ft_scale = self._kspace_gaussian_ft_scale(bw2)
+        kfac = amp * ft_scale * torch.exp(-0.5 * bw2 * k_sq.unsqueeze(-1))
         kfac = kfac.sum(dim=-1).masked_fill(~k_mode_mask, 0.0)
 
         diag_sum = kfac.sum() / (2.0 * volume)

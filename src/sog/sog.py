@@ -175,6 +175,9 @@ class Sog(nn.Module):
                     3, device=baseline_alphas.device
                 ).unsqueeze(0)
 
+        if latent_quads is not None:
+            latent_quads = Gaussian.make_quad_traceless(latent_quads)
+
         if compute_energy:
             if (
                 (latent_dipoles is not None)

@@ -218,6 +218,14 @@ class Gaussian(nn.Module):
         )["energy"]
 
     @staticmethod
+    def make_quad_traceless(quad: torch.Tensor) -> torch.Tensor:
+        """Symmetrize and project quadrupoles to traceless form (Kim/LES convention)."""
+        quad_sym = 0.5 * (quad + quad.transpose(-1, -2))
+        trace = torch.einsum("...aa->...", quad_sym)
+        eye = torch.eye(3, dtype=quad.dtype, device=quad.device)
+        return quad_sym - trace[..., None, None] * eye / 3.0
+
+    @staticmethod
     def _ensure_multipole_shapes(
         q: torch.Tensor,
         u: Optional[torch.Tensor],
@@ -240,6 +248,7 @@ class Gaussian(nn.Module):
                 raise ValueError(
                     f"quad shape mismatch: expected {(n, nq, 3, 3)}, got {tuple(quad.shape)}"
                 )
+            quad = Gaussian.make_quad_traceless(quad)
         if kappa is not None:
             if kappa.dim() == 1:
                 kappa = kappa.unsqueeze(1)

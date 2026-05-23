@@ -14,7 +14,7 @@ setup(
         "pytorch_finufft",
     ],
     author="SOG contributors",
-    description="Gaussian long-range SOG plugin",
+    description="Gaussian long-range SOG plugin with BSA initialization",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     python_requires=">=3.8",
